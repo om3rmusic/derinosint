@@ -1,0 +1,989 @@
+const STORAGE_KEY = 'osint_full_list';
+
+// ── TR KEYWORD LiSTESi ────────────────────────────────────────────────────────
+const trKeywords = [
+    'alastyr','atak domain','atakdomain','awez','aysima','burtinet','cenuta','clouduck',
+    'cizgi telekom','cizgi','databir','doruknet','ekiphost','fibuhosting','gri.net',
+    'guzel hosting','guzel.net.tr','hostixo','hosting.com.tr','hostlab','hostmavi',
+    'ihs telekom','ihs.com.tr','inetmar','isimkayit','isimtescil','istiridye','ixirhost',
+    'kapteyan','kebirhost','kurumsalhost','markum','megatrhost','natro','netdirekt',
+    'netinternet','netwebo','niobe hosting','niobehosting','odeaweb','poyraz hosting',
+    'poyrazhosting','radore','ruzgar bilisim','spd net','spdnet','sahin network',
+    'teklan','turhost','turkticaret','uzman tescil','vargonen','veridyen','verigom',
+    'veriloji','webadam','yoncu','metunic','turk','telekom','trabis','superonline',
+    'turkcell','tr-','comnet','netgsm','aerotek','nic.tr','dgn','teknosky','guclu',
+    'sadecehost','verigun','pendc','rabisu','keyubu','cloudef','sayfa.net','pluscloud',
+    'bogazici','ulakbim','ttnet','tpnet','turknet','dsmart','millenicom','vodafone tr',
+    'kablonet','seturnet','doruk','superbox','turk ekonomi bankasi','garanti','isbank',
+    'akbank','ziraat','halkbank','vakifbank','yapikradi','bimcell','turkcell superonline',
+    'bim','a101','migros','trendyol','hepsiburada','gittigidiyor','sahibinden',
+    'emlakjet','zingat','hurriyet','milliyet','sabah','haberturk','ntv','cnnturk',
+    'show tv','kanal d','fox tv','star tv','atv','trt'
+];
+
+// Cloudflare, büyük CDN ve proxy IP aralıkları — bu aralıklardaki IP'ler gerçek host değil
+const CDN_ASNS = ['AS13335','AS209242','AS132892','AS395747','AS203898', // Cloudflare
+    'AS16509','AS14618', // Amazon
+    'AS8075',            // Microsoft
+    'AS15169','AS396982',// Google
+    'AS20940',           // Akamai
+    'AS22822',           // Limelight
+    'AS60068',           // CDN77
+    'AS198203',          // Fastly alt
+    'AS54113',           // Fastly
+];
+
+// Cloudflare arkasını deşifre etmek için kullanılan subdomain listesi
+const BYPASS_SUBS = [
+    'mail','webmail','cpanel','whm','smtp','pop','pop3','imap','ftp','sftp',
+    'direct','origin','host','server','backend','admin','panel','portal',
+    'api','app','shop','store','static','assets','cdn','img','images',
+    'upload','media','ns1','ns2','ns3','mx','mx1','mx2','autodiscover',
+    'autoconfig','vpn','remote','owa','exchange','plesk','directadmin',
+    'billing','whmcs','support','helpdesk','crm','db','database','sql',
+    'dev','staging','test','beta','old','backup','new','secure','ssl'
+];
+
+// SPF mekanizmaları — bunları recursif çözeceğiz
+const SPF_MECHANISMS = ['include','redirect','a','mx'];
+
+if (chrome.sidePanel) {
+    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(e => console.error(e));
+}
+
+// ── YARDIMCI FONKSiYONLAR ────────────────────────────────────────────────────
+const norm = t => {
+    if (!t) return '';
+    return t.toLowerCase()
+        .replace(/ğ/g,'g').replace(/ü/g,'u').replace(/ş/g,'s')
+        .replace(/ı/g,'i').replace(/ö/g,'o').replace(/ç/g,'c').trim();
+};
+
+const isTRText = txt => trKeywords.some(k => norm(txt).includes(norm(k)));
+const isCDN    = asn => CDN_ASNS.some(c => (asn||'').toUpperCase().includes(c));
+
+const cleanUrl = u => {
+    try {
+        return decodeURIComponent(u).trim().toLowerCase()
+            .replace(/^https?:\/\//,'').replace(/^www\./,'').replace(/\/$/,'');
+    } catch(e) { return u; }
+};
+
+const parseKeywords = raw => raw.split(',').map(k=>k.trim()).filter(k=>k.length>0);
+
+const jFetch = async (url, timeout=8000) => {
+    const ctrl = new AbortController();
+    const tid  = setTimeout(() => ctrl.abort(), timeout);
+    try {
+        const r = await fetch(url, { signal: ctrl.signal });
+        clearTimeout(tid);
+        return r.json();
+    } catch(e) { clearTimeout(tid); throw e; }
+};
+
+const tFetch = async (url, timeout=8000) => {
+    const ctrl = new AbortController();
+    const tid  = setTimeout(() => ctrl.abort(), timeout);
+    try {
+        const r = await fetch(url, { signal: ctrl.signal });
+        clearTimeout(tid);
+        return r.text();
+    } catch(e) { clearTimeout(tid); throw e; }
+};
+
+const dnsQuery = async (name, type) => {
+    const r = await jFetch(`https://dns.google/resolve?name=${encodeURIComponent(name)}&type=${type}`);
+    return r.Answer || [];
+};
+
+const getIP = async host => {
+    const ans = await dnsQuery(host, 'A');
+    return ans.length ? ans[ans.length-1].data : null;
+};
+
+const ipInfo = async ip => {
+    try { return await jFetch(`https://ipinfo.io/${ip}/json`); } catch(e) { return {}; }
+};
+
+// ── TEMEL ANALİZ (hızlı tarama) ───────────────────────────────────────────────
+const basicAnalyze = async u => {
+    const urlObj = new URL(u);
+    const host   = urlObj.hostname;
+
+    const ip = await getIP(host).catch(()=>null) || '-';
+    let isp = '-', registrar = '-';
+
+    if (ip !== '-') {
+        const info = await ipInfo(ip);
+        isp = info.org || '-';
+    }
+    try {
+        const rdap = await jFetch(`https://rdap.org/domain/${host}`);
+        if (rdap.entities) {
+            const reg = rdap.entities.find(e => e.roles.includes('registrar'));
+            if (reg?.vcardArray) registrar = reg.vcardArray[1].find(v=>v[0]==='fn')?.[3] || '-';
+        }
+    } catch(e) {}
+
+    const isRegTR = isTRText(registrar);
+    const isIspTR = isTRText(isp);
+    const isExtTR = host.endsWith('.tr');
+    const isTR    = isRegTR || isIspTR || isExtTR;
+
+    return { u, host, ip, isp, registrar, isTR, isRegTR, isIspTR, isExtTR, urlObj };
+};
+
+// ── ULTRA DERİN ANALİZ MOTORU ────────────────────────────────────────────────
+const ultraDeepAnalyze = async (host, logFn) => {
+    const evidence = [];
+    const score    = { total: 0, max: 0 };
+    const addEv    = (msg, pts=1) => { evidence.push(msg); score.total += pts; };
+    const addMax   = pts => { score.max += pts; };
+
+    const data = {
+        // DNS
+        dns_a: [], dns_mx: [], dns_ns: [], dns_txt: [], dns_soa: '-',
+        dns_aaaa: [], dns_caa: [], dns_dnskey: [], dns_nsec: [],
+        // IPs
+        ip_main: '-', isp_main: '-', country_main: '-', asn_main: '-',
+        is_cdn: false, cdn_name: '-',
+        // Subdomain bypass
+        bypass_found: [],   // [{sub, ip, isp, country}]
+        // MX detay
+        mx_details: [],     // [{host, ip, isp, country, isTR}]
+        // SPF zinciri
+        spf_chain: [],      // tüm include edilen domainler
+        spf_ips: [],        // SPF'den çözülen IP'ler
+        // BGP
+        bgp_prefix: '-', bgp_asn: '-', bgp_asn_name: '-', bgp_country: '-',
+        // RDAP
+        rdap_registrar: '-', rdap_reg_url: '-', rdap_expiry: '-', rdap_created: '-',
+        rdap_nameservers: [], rdap_status: [],
+        // crt.sh
+        crt_domains: [], crt_issuers: [],
+        // Reverse IP
+        reverse_hosts: [],
+        // WHOIS raw
+        whois_raw: '-',
+        // Shodan alternatif (HackerTarget)
+        ht_hosts: [],
+        // NSEC / DNSSEC
+        dnssec_signed: false, nsec_records: [],
+        // Admin/teknik email ipuçları
+        email_hints: [],
+        // HTTP header ipuçları
+        http_headers: {},
+        // Puan
+        score,
+    };
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 1. DNS — Tüm kayıt türleri
+    // ──────────────────────────────────────────────────────────────────────────
+    logFn('info','[1/12] DNS kayıtları taranıyor (A/AAAA/MX/NS/TXT/SOA/CAA/DNSKEY/NSEC)...');
+
+    // A
+    addMax(2);
+    try {
+        const ans = await dnsQuery(host,'A');
+        data.dns_a = ans.map(a=>a.data);
+        data.ip_main = data.dns_a[data.dns_a.length-1] || '-';
+        logFn('ok',`[A] ${data.dns_a.join(', ')}`);
+    } catch(e) { logFn('err','[A] Hata'); }
+
+    // AAAA
+    try {
+        const ans = await dnsQuery(host,'AAAA');
+        data.dns_aaaa = ans.map(a=>a.data);
+        if (data.dns_aaaa.length) logFn('ok',`[AAAA] ${data.dns_aaaa.join(', ')}`);
+    } catch(e) {}
+
+    // MX
+    addMax(3);
+    try {
+        const ans = await dnsQuery(host,'MX');
+        data.dns_mx = ans.map(a=>a.data.replace(/^\d+\s+/,'').replace(/\.$/,''));
+        logFn(data.dns_mx.some(m=>isTRText(m))?'hit':'ok',`[MX] ${data.dns_mx.join(', ')||'yok'}`);
+        data.dns_mx.forEach(m => { if (isTRText(m)) addEv(`MX hostname TR altyapısına işaret ediyor: ${m}`,2); });
+    } catch(e) { logFn('err','[MX] Hata'); }
+
+    // NS
+    addMax(3);
+    try {
+        const ans = await dnsQuery(host,'NS');
+        data.dns_ns = ans.map(a=>a.data.replace(/\.$/,''));
+        logFn(data.dns_ns.some(n=>isTRText(n))?'hit':'ok',`[NS] ${data.dns_ns.join(', ')||'yok'}`);
+        data.dns_ns.forEach(ns => { if (isTRText(ns)) addEv(`Name Server TR barındırıcısına ait: ${ns}`,2); });
+    } catch(e) { logFn('err','[NS] Hata'); }
+
+    // TXT
+    addMax(2);
+    try {
+        const ans = await dnsQuery(host,'TXT');
+        data.dns_txt = ans.map(a=>a.data.replace(/"/g,''));
+        data.dns_txt.forEach(txt => {
+            logFn(isTRText(txt)?'hit':'ok',`[TXT] ${txt.substring(0,100)}`);
+            if (isTRText(txt)) addEv(`TXT/SPF kaydında TR izi: ${txt.substring(0,120)}`,2);
+        });
+    } catch(e) { logFn('err','[TXT] Hata'); }
+
+    // SOA
+    try {
+        const ans = await dnsQuery(host,'SOA');
+        if (ans[0]) {
+            data.dns_soa = ans[0].data;
+            logFn(isTRText(data.dns_soa)?'hit':'ok',`[SOA] ${data.dns_soa.substring(0,100)}`);
+            if (isTRText(data.dns_soa)) addEv(`SOA kaydında TR izi: ${data.dns_soa.substring(0,100)}`,1);
+        }
+    } catch(e) {}
+
+    // CAA
+    try {
+        const ans = await dnsQuery(host,'CAA');
+        data.dns_caa = ans.map(a=>a.data);
+        if (data.dns_caa.length) logFn('ok',`[CAA] ${data.dns_caa.join(', ')}`);
+    } catch(e) {}
+
+    // DNSKEY / DNSSEC
+    try {
+        const ans = await dnsQuery(host,'DNSKEY');
+        if (ans.length) {
+            data.dnssec_signed = true;
+            data.dns_dnskey = ans.map(a=>a.data.substring(0,40)+'...');
+            logFn('ok',`[DNSSEC] İmzalı zone — ${ans.length} DNSKEY`);
+        } else {
+            logFn('warn','[DNSSEC] Zone imzasız');
+        }
+    } catch(e) {}
+
+    // NSEC — zone walking için
+    try {
+        const ans = await dnsQuery(host,'NSEC');
+        data.nsec_records = ans.map(a=>a.data);
+        if (data.nsec_records.length) {
+            logFn('ok',`[NSEC] ${data.nsec_records.length} NSEC kaydı`);
+            data.nsec_records.forEach(n => { if (isTRText(n)) addEv(`NSEC kaydında TR izi: ${n}`,1); });
+        }
+    } catch(e) {}
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 2. Ana IP — ipinfo + BGP
+    // ──────────────────────────────────────────────────────────────────────────
+    logFn('info','[2/12] Ana IP analizi...');
+    addMax(4);
+    if (data.ip_main !== '-') {
+        try {
+            const info = await ipInfo(data.ip_main);
+            data.isp_main     = info.org     || '-';
+            data.country_main = info.country || '-';
+            data.asn_main     = (info.org||'').split(' ')[0] || '-';
+            data.is_cdn       = isCDN(data.isp_main);
+            data.cdn_name     = data.is_cdn ? data.isp_main : '-';
+
+            logFn(data.country_main==='TR'||isTRText(data.isp_main)?'hit':
+                  data.is_cdn?'warn':'ok',
+                `[IPINFO] ${data.isp_main} | ${data.country_main}${data.is_cdn?' ⚠️ CDN/PROXY':''}`);
+
+            if (data.country_main==='TR') addEv(`Ana IP Türkiye'de: ${data.ip_main} (${data.isp_main})`,3);
+            if (isTRText(data.isp_main))  addEv(`Ana ISP TR altyapısı: ${data.isp_main}`,3);
+            if (data.is_cdn) logFn('warn',`[CDN] ${data.cdn_name} arkasında — bypass deneniyor...`);
+        } catch(e) { logFn('err','[IPINFO] Hata'); }
+
+        // BGP View
+        try {
+            const bgp = await jFetch(`https://api.bgpview.io/ip/${data.ip_main}`);
+            if (bgp.status==='ok') {
+                const p = bgp.data?.prefixes?.[0];
+                if (p) {
+                    data.bgp_prefix   = p.prefix  || '-';
+                    data.bgp_asn      = `AS${p.asn?.asn}` || '-';
+                    data.bgp_asn_name = p.asn?.name        || '-';
+                    data.bgp_country  = p.asn?.country_code|| '-';
+                    logFn(data.bgp_country==='TR'||isTRText(data.bgp_asn_name)?'hit':'ok',
+                        `[BGP] ${data.bgp_asn_name} | ${data.bgp_country} | ${data.bgp_prefix}`);
+                    if (data.bgp_country==='TR') addEv(`BGP prefix Türkiye'ye ait: ${data.bgp_prefix} (${data.bgp_asn_name})`,3);
+                    if (isTRText(data.bgp_asn_name)) addEv(`BGP ASN adı TR: ${data.bgp_asn_name}`,2);
+                }
+            }
+        } catch(e) { logFn('warn','[BGP] Yanıt alınamadı (CORS olabilir)'); }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 3. CLOUDFLARE / CDN BYPASS — Subdomain brute-force
+    // ──────────────────────────────────────────────────────────────────────────
+    logFn('info','[3/12] CDN bypass — subdomain taraması başlıyor...');
+    addMax(5);
+    const bypassPromises = BYPASS_SUBS.map(async sub => {
+        const fqdn = `${sub}.${host}`;
+        try {
+            const ip = await getIP(fqdn);
+            if (!ip) return null;
+            if (data.dns_a.includes(ip)) return null; // Ana IP ile aynıysa CDN, atla
+            const info = await ipInfo(ip);
+            const isp  = info.org     || '-';
+            const cc   = info.country || '-';
+            return { sub: fqdn, ip, isp, country: cc, isTR: cc==='TR'||isTRText(isp) };
+        } catch(e) { return null; }
+    });
+    const bypassResults = (await Promise.allSettled(bypassPromises))
+        .map(r => r.status==='fulfilled' ? r.value : null)
+        .filter(Boolean);
+
+    data.bypass_found = bypassResults;
+    bypassResults.forEach(b => {
+        logFn(b.isTR?'hit':'ok',`[BYPASS] ${b.sub} → ${b.ip} → ${b.isp} (${b.country})`);
+        if (b.isTR) addEv(`Subdomain bypass: ${b.sub} → ${b.ip} → ${b.isp} (${b.country})`,4);
+    });
+    if (!bypassResults.length) logFn('ok','[BYPASS] Farklı IP\'li subdomain bulunamadı');
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 4. MX Sunucuları Derinlemesine
+    // ──────────────────────────────────────────────────────────────────────────
+    logFn('info','[4/12] MX sunucuları analiz ediliyor...');
+    addMax(3);
+    for (const mx of data.dns_mx.slice(0,5)) {
+        try {
+            const ip  = await getIP(mx);
+            if (!ip) continue;
+            const inf = await ipInfo(ip);
+            const isp = inf.org     || '-';
+            const cc  = inf.country || '-';
+            const isTR = cc==='TR' || isTRText(isp) || isTRText(mx);
+            data.mx_details.push({ host:mx, ip, isp, country:cc, isTR });
+            logFn(isTR?'hit':'ok',`[MX] ${mx} → ${ip} → ${isp} (${cc})`);
+            if (isTR) addEv(`MX sunucusu TR altyapısında: ${mx} → ${ip} → ${isp} (${cc})`,3);
+        } catch(e) {}
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 5. SPF Zincir Takibi (Recursive)
+    // ──────────────────────────────────────────────────────────────────────────
+    logFn('info','[5/12] SPF zinciri recursive çözülüyor...');
+    addMax(2);
+    const spfResolved = new Set();
+
+    const resolveSPF = async (domain, depth=0) => {
+        if (depth > 4 || spfResolved.has(domain)) return;
+        spfResolved.add(domain);
+        try {
+            const ans = await dnsQuery(domain,'TXT');
+            for (const rec of ans) {
+                const txt = rec.data.replace(/"/g,'');
+                if (!txt.startsWith('v=spf')) continue;
+                logFn('ok',`[SPF@${domain}] ${txt.substring(0,100)}`);
+                if (isTRText(txt)) addEv(`SPF kaydında TR izi (${domain}): ${txt.substring(0,100)}`,2);
+
+                // include: takip et
+                const includes = [...txt.matchAll(/include:([^\s]+)/g)].map(m=>m[1]);
+                const redirects = [...txt.matchAll(/redirect=([^\s]+)/g)].map(m=>m[1]);
+                const aMechs    = [...txt.matchAll(/(?:^|\s)a:([^\s]+)/g)].map(m=>m[1]);
+                const ip4s      = [...txt.matchAll(/ip4:([^\s]+)/g)].map(m=>m[1]);
+                const ip6s      = [...txt.matchAll(/ip6:([^\s]+)/g)].map(m=>m[1]);
+
+                ip4s.forEach(ip => {
+                    data.spf_ips.push({ domain, ip });
+                    logFn(isTRText(ip)?'hit':'ok',`[SPF-IP4] ${ip}`);
+                });
+
+                for (const inc of [...includes,...redirects,...aMechs]) {
+                    data.spf_chain.push({ from:domain, inc });
+                    logFn(isTRText(inc)?'hit':'ok',`[SPF-INC] ${domain} → ${inc}`);
+                    if (isTRText(inc)) addEv(`SPF include TR altyapısı: ${inc}`,2);
+                    await resolveSPF(inc, depth+1);
+                }
+            }
+        } catch(e) {}
+    };
+    await resolveSPF(host);
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 6. RDAP Derinlemesine
+    // ──────────────────────────────────────────────────────────────────────────
+    logFn('info','[6/12] RDAP / Domain kayıt bilgisi...');
+    addMax(3);
+
+    // Önce genel rdap.org dene, .tr ise nic.tr dene
+    const rdapUrls = host.endsWith('.tr')
+        ? [`https://rdap.nic.tr/domain/${host}`,`https://rdap.org/domain/${host}`]
+        : [`https://rdap.org/domain/${host}`];
+
+    for (const rdapUrl of rdapUrls) {
+        try {
+            const rdap = await jFetch(rdapUrl);
+            if (rdap.entities) {
+                const reg = rdap.entities.find(e=>e.roles.includes('registrar'));
+                if (reg?.vcardArray) {
+                    data.rdap_registrar = reg.vcardArray[1].find(v=>v[0]==='fn')?.[3] || '-';
+                    const urlE = reg.vcardArray[1].find(v=>v[0]==='url');
+                    data.rdap_reg_url   = urlE ? urlE[3] : '-';
+                    // email
+                    const emailE = reg.vcardArray[1].find(v=>v[0]==='email');
+                    if (emailE) data.email_hints.push(`Registrar email: ${emailE[3]}`);
+                }
+                // teknik/admin kontaklar
+                rdap.entities.forEach(e => {
+                    if (['technical','administrative','abuse'].some(r=>e.roles.includes(r))) {
+                        if (e.vcardArray) {
+                            const em = e.vcardArray[1].find(v=>v[0]==='email');
+                            if (em) data.email_hints.push(`${e.roles.join('/')} email: ${em[3]}`);
+                            const fn = e.vcardArray[1].find(v=>v[0]==='fn');
+                            if (fn && isTRText(fn[3])) addEv(`Teknik/admin kişi TR ismi: ${fn[3]}`,1);
+                        }
+                    }
+                });
+            }
+            if (rdap.events) {
+                const exp = rdap.events.find(e=>e.eventAction==='expiration');
+                const cre = rdap.events.find(e=>e.eventAction==='registration');
+                data.rdap_expiry  = exp ? exp.eventDate.substring(0,10) : '-';
+                data.rdap_created = cre ? cre.eventDate.substring(0,10) : '-';
+            }
+            if (rdap.nameservers) data.rdap_nameservers = rdap.nameservers.map(n=>n.ldhName||'');
+            if (rdap.status)      data.rdap_status = rdap.status;
+
+            logFn(isTRText(data.rdap_registrar)?'hit':'ok',`[RDAP] Registrar: ${data.rdap_registrar}`);
+            if (isTRText(data.rdap_registrar)) addEv(`Domain registrar TR firması: ${data.rdap_registrar}`,3);
+            if (data.rdap_reg_url && isTRText(data.rdap_reg_url)) addEv(`Registrar URL TR: ${data.rdap_reg_url}`,1);
+
+            data.rdap_nameservers.forEach(ns => {
+                if (isTRText(ns)) addEv(`RDAP nameserver TR: ${ns}`,2);
+            });
+            break;
+        } catch(e) { logFn('warn',`[RDAP] ${rdapUrl} yanıt vermedi`); }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 7. crt.sh — SSL sertifika geçmişi + SAN analizi
+    // ──────────────────────────────────────────────────────────────────────────
+    logFn('info','[7/12] crt.sh SSL sertifika geçmişi...');
+    addMax(2);
+    try {
+        const certs = await jFetch(`https://crt.sh/?q=%.${host}&output=json`);
+        if (Array.isArray(certs)) {
+            const names   = new Set();
+            const issuers = new Set();
+            certs.slice(0,100).forEach(c => {
+                (c.name_value||'').split('\n').forEach(n => {
+                    const clean = n.replace(/^\*\./,'').trim().toLowerCase();
+                    if (clean && clean!==host && !clean.includes('*')) names.add(clean);
+                });
+                if (c.issuer_name) issuers.add(c.issuer_name);
+            });
+            data.crt_domains = [...names].slice(0,20);
+            data.crt_issuers = [...issuers].slice(0,5);
+            logFn('ok',`[CRT] ${data.crt_domains.length} ilişkili domain, ${data.crt_issuers.length} issuer`);
+            data.crt_domains.forEach(d => {
+                if (d.endsWith('.tr')) addEv(`SSL sertifikasında .tr domain: ${d}`,2);
+                if (isTRText(d))       addEv(`SSL SAN'da TR barındırıcı izi: ${d}`,1);
+            });
+            data.crt_issuers.forEach(i => {
+                if (isTRText(i)) addEv(`SSL issuer TR: ${i}`,1);
+            });
+        }
+    } catch(e) { logFn('err','[CRT] Hata'); }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 8. Reverse IP — HackerTarget
+    // ──────────────────────────────────────────────────────────────────────────
+    logFn('info','[8/12] Reverse IP — aynı sunucudaki siteler...');
+    addMax(2);
+    if (data.ip_main !== '-') {
+        // Eğer CDN ise bypass IP'lerini de dene
+        const ipsToCheck = [data.ip_main, ...data.bypass_found.map(b=>b.ip)].filter((v,i,a)=>a.indexOf(v)===i).slice(0,3);
+        for (const ip of ipsToCheck) {
+            try {
+                const txt = await tFetch(`https://api.hackertarget.com/reverseiplookup/?q=${ip}`);
+                if (txt && !txt.includes('error') && !txt.includes('API count')) {
+                    const hosts = txt.split('\n').map(l=>l.trim()).filter(l=>l.length>3);
+                    data.reverse_hosts.push(...hosts);
+                    logFn('ok',`[REVIP@${ip}] ${hosts.length} komşu site`);
+                    const trNeigh = hosts.filter(h=>h.endsWith('.tr'));
+                    if (trNeigh.length) addEv(`Aynı IP'de (${ip}) ${trNeigh.length} adet .tr sitesi: ${trNeigh.slice(0,3).join(', ')}`,3);
+                } else {
+                    logFn('warn',`[REVIP@${ip}] Limit veya hata`);
+                }
+            } catch(e) { logFn('err',`[REVIP@${ip}] Hata`); }
+            await new Promise(r=>setTimeout(r,500));
+        }
+        data.reverse_hosts = [...new Set(data.reverse_hosts)].slice(0,30);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 9. HackerTarget Host Search (geçmiş subdomain/IP)
+    // ──────────────────────────────────────────────────────────────────────────
+    logFn('info','[9/12] HackerTarget host geçmişi...');
+    try {
+        const txt = await tFetch(`https://api.hackertarget.com/hostsearch/?q=${host}`);
+        if (txt && !txt.includes('error') && !txt.includes('API count')) {
+            data.ht_hosts = txt.split('\n').map(l=>l.trim()).filter(l=>l.length>3).slice(0,20);
+            logFn('ok',`[HOSTSEARCH] ${data.ht_hosts.length} kayıt`);
+            // Geçmişte farklı IP vardı mı?
+            const oldIps = data.ht_hosts.map(h=>h.split(',')[1]).filter(Boolean);
+            for (const oldIp of oldIps.slice(0,5)) {
+                if (oldIp === data.ip_main) continue;
+                try {
+                    const inf = await ipInfo(oldIp);
+                    const isp = inf.org||'-'; const cc = inf.country||'-';
+                    logFn(cc==='TR'||isTRText(isp)?'hit':'ok',`[HISTORY-IP] ${oldIp} → ${isp} (${cc})`);
+                    if (cc==='TR'||isTRText(isp)) addEv(`Geçmiş IP Türkiye'de (${oldIp}): ${isp}`,3);
+                } catch(e) {}
+            }
+        } else { logFn('warn','[HOSTSEARCH] Limit'); }
+    } catch(e) { logFn('err','[HOSTSEARCH] Hata'); }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 10. _dmarc / _domainkey TXT kayıtları
+    // ──────────────────────────────────────────────────────────────────────────
+    logFn('info','[10/12] DMARC / DKIM kayıtları...');
+    addMax(1);
+    for (const prefix of ['_dmarc','default._domainkey','mail._domainkey','smtp._domainkey']) {
+        try {
+            const ans = await dnsQuery(`${prefix}.${host}`,'TXT');
+            ans.forEach(a => {
+                const txt = a.data.replace(/"/g,'');
+                logFn(isTRText(txt)?'hit':'ok',`[${prefix.toUpperCase()}] ${txt.substring(0,100)}`);
+                if (isTRText(txt)) addEv(`${prefix} kaydında TR izi: ${txt.substring(0,100)}`,2);
+            });
+        } catch(e) {}
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 11. www. ve mail. için ayrı IP çözümlemesi
+    // ──────────────────────────────────────────────────────────────────────────
+    logFn('info','[11/12] www/mail subdomain IP kontrolü...');
+    addMax(2);
+    for (const sub of ['www','mail','smtp','ftp','cpanel']) {
+        try {
+            const ip = await getIP(`${sub}.${host}`);
+            if (!ip || data.dns_a.includes(ip)) continue; // CDN ile aynıysa atla
+            const inf = await ipInfo(ip);
+            const isp = inf.org||'-'; const cc = inf.country||'-';
+            data.bypass_found.push({ sub:`${sub}.${host}`, ip, isp, country:cc, isTR: cc==='TR'||isTRText(isp) });
+            logFn(cc==='TR'||isTRText(isp)?'hit':'ok',`[${sub.toUpperCase()}] ${ip} → ${isp} (${cc})`);
+            if (cc==='TR'||isTRText(isp)) addEv(`${sub}.${host} → ${ip} → ${isp} (${cc}) — Gerçek sunucu TR`,4);
+        } catch(e) {}
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 12. HTTP Header analizi (fetch ile)
+    // ──────────────────────────────────────────────────────────────────────────
+    logFn('info','[12/12] HTTP response header analizi...');
+    addMax(1);
+    try {
+        const resp = await fetch(`https://${host}`, { method:'HEAD', redirect:'follow' });
+        const interestingHeaders = ['server','x-powered-by','x-hosting','x-provider',
+            'x-cdn','via','x-cache','cf-ray','x-amz-cf-id','x-vercel-id'];
+        interestingHeaders.forEach(h => {
+            const val = resp.headers.get(h);
+            if (val) {
+                data.http_headers[h] = val;
+                logFn(isTRText(val)?'hit':'ok',`[HEADER] ${h}: ${val}`);
+                if (isTRText(val)) addEv(`HTTP header'da TR izi — ${h}: ${val}`,2);
+            }
+        });
+    } catch(e) { logFn('warn','[HEADER] Erişim engellendi veya hata'); }
+
+    // ── SONUÇ ────────────────────────────────────────────────────────────────
+    const deepIsTR = evidence.length > 0;
+    const pct      = score.max > 0 ? Math.min(100, Math.round(score.total / score.max * 100)) : 0;
+    data.score     = { total: score.total, max: score.max, pct };
+
+    logFn(deepIsTR ? 'hit' : 'ok',
+        `✅ ANALİZ TAMAMLANDI: ${evidence.length} kanıt | TR Skoru: ${score.total}/${score.max} (%${pct})`);
+
+    return { data, evidence, deepIsTR, score: data.score };
+};
+
+// ── MODAL RENDER ─────────────────────────────────────────────────────────────
+const isTRText2 = txt => trKeywords.some(k => norm(txt).includes(norm(k)));
+
+const renderModal = (host, result) => {
+    const { data, evidence, deepIsTR, score } = result;
+    const mc = document.getElementById('modal-content');
+
+    const row = (key, val, cls='') =>
+        `<div class="deep-row"><span class="deep-key">${key}</span><span class="deep-val ${cls}">${val||'-'}</span></div>`;
+
+    const trC = t => isTRText2(t) ? 'tr-hit' : '';
+    const ccC = c => c==='TR'     ? 'tr-hit' : '';
+
+    let html = '';
+
+    // Karar + skor
+    const barColor = score.pct >= 60 ? '#dc2626' : score.pct >= 30 ? '#d97706' : '#16a34a';
+    html += deepIsTR
+        ? `<div class="verdict-tr">⚠️ TR ALTYAPISI TESPİT EDİLDİ — ${evidence.length} kanıt</div>`
+        : `<div class="verdict-safe">✅ Belirgin TR altyapı kanıtı bulunamadı</div>`;
+    html += `<div class="score-label" style="color:${barColor}">TR Altyapı Skoru: ${score.total}/${score.max} (%${score.pct})</div>
+             <div class="score-bar-wrap"><div class="score-bar" style="width:${score.pct}%;background:${barColor}"></div></div>`;
+
+    // Kanıtlar
+    if (evidence.length) {
+        html += `<div class="evidence-box"><div class="evidence-title">🔎 Bulunan Kanıtlar (${evidence.length})</div>`;
+        evidence.forEach(e => { html += `<div class="evidence-item">${e}</div>`; });
+        html += `</div>`;
+    }
+
+    // DNS
+    html += `<div class="deep-section"><div class="deep-section-title">📡 DNS Kayıtları</div>`;
+    html += row('A (IP)', data.dns_a.join(', '));
+    html += row('AAAA (IPv6)', data.dns_aaaa.join(', ')||'-');
+    html += row('MX', data.dns_mx.map(m=>`<span class="${trC(m)}">${m}</span>`).join('<br>')||'-');
+    html += row('NS', data.dns_ns.map(n=>`<span class="${trC(n)}">${n}</span>`).join('<br>')||'-');
+    html += row('TXT/SPF', data.dns_txt.map(t=>`<span class="${trC(t)}">${t.substring(0,120)}</span>`).join('<br>')||'-');
+    html += row('SOA', `<span class="${trC(data.dns_soa)}">${(data.dns_soa||'-').substring(0,100)}</span>`);
+    html += row('CAA', data.dns_caa.join(', ')||'-');
+    html += row('DNSSEC', data.dnssec_signed ? '<span class="safe">İmzalı ✓</span>' : '<span class="neutral">İmzasız</span>');
+    if (data.nsec_records.length) html += row('NSEC', data.nsec_records.join('<br>'));
+    html += `</div>`;
+
+    // IP & Altyapı
+    html += `<div class="deep-section"><div class="deep-section-title">🌐 IP & Altyapı</div>`;
+    html += row('Ana IP', data.ip_main);
+    html += row('ISP / ASN', `<span class="${trC(data.isp_main)}">${data.isp_main}</span>`);
+    html += row('IP Ülkesi', `<span class="${ccC(data.country_main)}">${data.country_main}</span>`);
+    html += row('CDN / Proxy', data.is_cdn ? `<span class="danger">⚠️ ${data.cdn_name} — Gerçek IP gizli</span>` : '<span class="safe">CDN yok</span>');
+    html += row('BGP Prefix', data.bgp_prefix);
+    html += row('BGP ASN', `<span class="${trC(data.bgp_asn_name)}">${data.bgp_asn} ${data.bgp_asn_name}</span>`);
+    html += row('BGP Ülke', `<span class="${ccC(data.bgp_country)}">${data.bgp_country}</span>`);
+    html += `</div>`;
+
+    // CDN Bypass
+    if (data.bypass_found.length) {
+        html += `<div class="deep-section"><div class="deep-section-title">🔓 CDN Bypass — Gerçek Sunucu Tespiti</div>`;
+        data.bypass_found.forEach(b => {
+            html += row(b.isTR?`⚠️ ${b.sub}`:`✓ ${b.sub}`,
+                `${b.ip} → <span class="${b.isTR?'tr-hit':''}">${b.isp} (${b.country})</span>`);
+        });
+        html += `</div>`;
+    }
+
+    // MX Detay
+    if (data.mx_details.length) {
+        html += `<div class="deep-section"><div class="deep-section-title">📧 MX Sunucuları</div>`;
+        data.mx_details.forEach(m => {
+            html += row(m.isTR?`⚠️ ${m.host}`:`✓ ${m.host}`,
+                `${m.ip} → <span class="${m.isTR?'tr-hit':''}">${m.isp} (${m.country})</span>`);
+        });
+        html += `</div>`;
+    }
+
+    // SPF Zinciri
+    if (data.spf_chain.length || data.spf_ips.length) {
+        html += `<div class="deep-section"><div class="deep-section-title">✉️ SPF Zinciri</div>`;
+        data.spf_chain.forEach(s => {
+            html += row(`${s.from} → include`, `<span class="${trC(s.inc)}">${s.inc}</span>`);
+        });
+        data.spf_ips.forEach(s => {
+            html += row(`${s.domain} → ip4`, s.ip);
+        });
+        html += `</div>`;
+    }
+
+    // RDAP
+    html += `<div class="deep-section"><div class="deep-section-title">📋 Domain Kayıt (RDAP)</div>`;
+    html += row('Registrar', `<span class="${trC(data.rdap_registrar)}">${data.rdap_registrar}</span>`);
+    html += row('Registrar URL', `<span class="${trC(data.rdap_reg_url)}">${data.rdap_reg_url}</span>`);
+    html += row('Kayıt Tarihi', data.rdap_created);
+    html += row('Son Kullanma', data.rdap_expiry);
+    html += row('Durum', data.rdap_status.join(', ')||'-');
+    if (data.rdap_nameservers.length)
+        html += row('Nameservers', data.rdap_nameservers.map(n=>`<span class="${trC(n)}">${n}</span>`).join('<br>'));
+    if (data.email_hints.length)
+        html += row('Email İpuçları', data.email_hints.join('<br>'));
+    html += `</div>`;
+
+    // HTTP Headers
+    if (Object.keys(data.http_headers).length) {
+        html += `<div class="deep-section"><div class="deep-section-title">🌍 HTTP Response Headers</div>`;
+        Object.entries(data.http_headers).forEach(([k,v]) => {
+            html += row(k, `<span class="${trC(v)}">${v}</span>`);
+        });
+        html += `</div>`;
+    }
+
+    // crt.sh
+    if (data.crt_domains.length) {
+        html += `<div class="deep-section"><div class="deep-section-title">🔐 SSL Sertifika İlişkili Domainler</div>`;
+        data.crt_domains.forEach(d => {
+            html += row(d.endsWith('.tr')||isTRText2(d)?'⚠️ İlişkili':'✓ İlişkili',
+                `<span class="${d.endsWith('.tr')||isTRText2(d)?'tr-hit':''}">${d}</span>`);
+        });
+        if (data.crt_issuers.length) html += row('Sertifika Veren', data.crt_issuers.join('<br>'));
+        html += `</div>`;
+    }
+
+    // Reverse IP
+    if (data.reverse_hosts.length) {
+        html += `<div class="deep-section"><div class="deep-section-title">🔄 Aynı Sunucudaki Siteler</div>`;
+        data.reverse_hosts.slice(0,20).forEach(h => {
+            html += row(h.endsWith('.tr')?'⚠️ .TR Site':'✓ Site',
+                `<span class="${h.endsWith('.tr')?'tr-hit':''}">${h}</span>`);
+        });
+        html += `</div>`;
+    }
+
+    // HackerTarget geçmiş
+    if (data.ht_hosts.length) {
+        html += `<div class="deep-section"><div class="deep-section-title">🕰️ Subdomain / IP Geçmişi</div>`;
+        data.ht_hosts.forEach(h => { html += row('Kayıt', h); });
+        html += `</div>`;
+    }
+
+    mc.innerHTML = html;
+};
+
+// ── ANA UYGULAMA ─────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', async () => {
+    let domainList  = [];
+    const tbody     = document.getElementById('tbody');
+    const sts       = document.getElementById('sts');
+    const stsTxt    = document.getElementById('liste-durum');
+    const progBar   = document.getElementById('progress-bar');
+    const kwInput   = document.getElementById('keywords-input');
+    const kwPrev    = document.getElementById('keywords-preview');
+    let results     = [];
+    let deepResults = {};
+
+    const loadList = () => {
+        chrome.storage.local.get([STORAGE_KEY], d => {
+            domainList = d[STORAGE_KEY] || [];
+            stsTxt.innerHTML = domainList.length > 0
+                ? `✅ Hafızada <b>${domainList.length.toLocaleString()}</b> adres var.`
+                : `⚠️ Liste boş. Lütfen yükleyin.`;
+        });
+    };
+    loadList();
+
+    kwInput.addEventListener('input', () => {
+        const kws = parseKeywords(kwInput.value);
+        kwPrev.innerHTML = kws.length ? kws.map(k=>`<span class="tag-keyword">${k}</span>`).join('') : '';
+    });
+
+    document.getElementById('btn-yukle').onclick = () => document.getElementById('file-upload').click();
+    document.getElementById('file-upload').onchange = e => {
+        const file = e.target.files[0];
+        const reader = new FileReader();
+        reader.onload = ev => {
+            const lines = ev.target.result.split(/\r?\n/).map(l=>cleanUrl(l.trim())).filter(l=>l.length>3);
+            domainList = [...new Set(lines)];
+            chrome.storage.local.set({[STORAGE_KEY]:domainList}, () => { alert('Liste Güncellendi!'); loadList(); });
+        };
+        reader.readAsText(file);
+    };
+
+    document.getElementById('btn-temizle').onclick = () => {
+        if (confirm('Hafıza silinsin mi?')) {
+            chrome.storage.local.remove(STORAGE_KEY, () => { domainList = []; loadList(); });
+        }
+    };
+
+    const fetchGoogleLinks = async (searchUrl, maxPages) => {
+        let all = [], nextUrl = searchUrl;
+        for (let p = 1; p <= maxPages; p++) {
+            sts.innerHTML = `🌐 Sayfa ${p} okunuyor...`;
+            try {
+                const html = await tFetch(nextUrl);
+                const doc  = new DOMParser().parseFromString(html,'text/html');
+                const lnks = [...doc.querySelectorAll('div.g a, h3 a, .yuRUbf a')]
+                    .map(a=>a.href).filter(u=>u&&!u.includes('google.com')&&u.startsWith('http'));
+                all.push(...lnks);
+                const nxt = doc.querySelector('a#pnnext');
+                if (nxt && p<maxPages) nextUrl='https://www.google.com'+nxt.getAttribute('href');
+                else break;
+                await new Promise(r=>setTimeout(r,700));
+            } catch(e) { break; }
+        }
+        return all;
+    };
+
+    const insertDivider = (kw, count) => {
+        const row = tbody.insertRow();
+        row.classList.add('divider-row');
+        row.innerHTML = `<td colspan="3">🔎 "${kw}" — ${count} sonuç</td>`;
+    };
+
+    const insertRow = (r, idx) => {
+        const row = tbody.insertRow();
+        row.id = `row-${idx}`;
+        if (!r.isTR) row.classList.add('row-non-tr');
+        const rootDomain = `${r.urlObj.protocol}//${r.urlObj.hostname}`;
+        row.innerHTML = `
+          <td style="word-break:break-all;font-size:9px;">
+            ${!r.isTR?`<span class="badge badge-red">⚠️ TR DIŞI</span>`:''}
+            <span class="quick-open" data-url="${rootDomain}">🔍</span>
+            ${r.u}
+            <button class="deep-btn" data-host="${r.host}" data-idx="${idx}" id="dbtn-${idx}">🔬 Derin Analiz</button>
+          </td>
+          <td style="font-size:9px;">
+            <div class="${r.isRegTR?'tr-hit':''}">${r.isRegTR||r.isExtTR?'🇹🇷 ':''} ${r.registrar}</div>
+            <div style="color:#38bdf8">${r.ip}</div>
+            <div class="${r.isIspTR?'tr-hit':''}">${r.isIspTR?'🇹🇷 ':''} ${r.isp}</div>
+          </td>
+          <td id="status-${idx}" style="font-weight:bold;font-size:9px;color:${r.isReported?'#4ade80':'#f87171'}">
+            ${r.isReported?'DÜZENLENDİ':'DÜZENLENMEDİ'}
+          </td>`;
+    };
+
+    document.getElementById('btn-tara').onclick = async () => {
+        const rawKw = kwInput.value.trim();
+        if (!rawKw) { alert('Lütfen en az bir arama kelimesi girin!'); return; }
+        const keywords = parseKeywords(rawKw);
+        if (!keywords.length) { alert('Geçerli anahtar kelime bulunamadı!'); return; }
+
+        const maxPages = parseInt(document.getElementById('sayfa-sayisi').value)||1;
+        sts.innerHTML  = '⏳ Başlatılıyor...';
+        tbody.innerHTML='';
+        results=[]; deepResults={};
+        progBar.style.width='0%';
+        document.getElementById('dl-area').style.display='none';
+
+        const kwLinks=[];
+        let totalLinks=0;
+        for (let i=0;i<keywords.length;i++) {
+            const kw=keywords[i];
+            sts.innerHTML=`🌐 "${kw}" aranıyor...`;
+            const links=[...new Set(await fetchGoogleLinks(`https://www.google.com/search?q=${encodeURIComponent(kw)}&hl=tr`,maxPages))];
+            kwLinks.push({keyword:kw,links});
+            totalLinks+=links.length;
+            progBar.style.width=`${Math.round((i+1)/keywords.length*20)}%`;
+        }
+
+        sts.innerHTML=`🔎 Toplam ${totalLinks} URL analiz edilecek...`;
+        let processed=0;
+
+        for (const {keyword,links} of kwLinks) {
+            insertDivider(keyword,links.length);
+            for (const u of links) {
+                try {
+                    sts.innerHTML=`⏳ ${new URL(u).hostname}...`;
+                    const r = await basicAnalyze(u);
+                    const cUrl=cleanUrl(u);
+                    r.isReported=domainList.some(s=>cUrl.includes(s)||s.includes(cUrl));
+                    r.keyword=keyword;
+                    const idx=results.length;
+                    results.push(r);
+                    insertRow(r,idx);
+                    processed++;
+                    progBar.style.width=`${20+Math.round(processed/totalLinks*80)}%`;
+                } catch(e){}
+            }
+        }
+
+        progBar.style.width='100%';
+        sts.innerHTML=`✅ Tarama tamamlandı. ${results.length} sonuç.`;
+        document.getElementById('dl-area').style.display='flex';
+    };
+
+    // Tek site derin analiz
+    const openDeepModal = async (host, idx) => {
+        const modal   = document.getElementById('deep-modal');
+        const logEl   = document.getElementById('modal-step-log');
+        const content = document.getElementById('modal-content');
+        document.getElementById('modal-domain-title').textContent=`🔬 Ultra Derin Analiz: ${host}`;
+        logEl.innerHTML='';
+        content.innerHTML='<div class="deep-loading"><span class="spinner"></span> Analiz yapılıyor...</div>';
+        modal.style.display='block';
+
+        const logFn=(type,msg)=>{
+            const d=document.createElement('div');
+            d.className=`log-${type}`;
+            d.textContent=msg;
+            logEl.appendChild(d);
+            logEl.scrollTop=logEl.scrollHeight;
+        };
+
+        if (deepResults[host]) { renderModal(host,deepResults[host]); return; }
+
+        const btn=document.getElementById(`dbtn-${idx}`);
+        if (btn){btn.textContent='⏳ Çalışıyor...';btn.classList.add('running');btn.disabled=true;}
+
+        try {
+            const result=await ultraDeepAnalyze(host,logFn);
+            deepResults[host]=result;
+            renderModal(host,result);
+            const row=document.getElementById(`row-${idx}`);
+            if (row&&result.deepIsTR){
+                row.classList.remove('row-non-tr');
+                row.classList.add('row-deep-tr');
+                const sc=document.getElementById(`status-${idx}`);
+                if (sc) sc.innerHTML+=`<br><span class="badge badge-yellow">🇹🇷 DERİN TR</span>`;
+            }
+            if (btn){btn.textContent='📋 Analizi Gör';btn.classList.remove('running');btn.classList.add('done');btn.disabled=false;}
+        } catch(e) {
+            content.innerHTML=`<div style="color:#f87171;padding:10px;">Hata: ${e.message}</div>`;
+            if (btn){btn.textContent='❌ Hata';btn.disabled=false;}
+        }
+    };
+
+    // Tümüne derin analiz
+    document.getElementById('btn-deep-all').onclick=async()=>{
+        if (!results.length){alert('Önce tarama yapın!');return;}
+        if (!confirm(`${results.length} site için ultra derin analiz yapılacak. Uzun sürebilir. Devam?`)) return;
+        document.getElementById('btn-deep-all').disabled=true;
+        progBar.style.width='0%';
+        for (let i=0;i<results.length;i++){
+            const r=results[i];
+            sts.innerHTML=`🔬 Derin: ${r.host} (${i+1}/${results.length})`;
+            const btn=document.getElementById(`dbtn-${i}`);
+            if (btn){btn.textContent='⏳...';btn.classList.add('running');btn.disabled=true;}
+            if (!deepResults[r.host]){
+                try {
+                    const res=await ultraDeepAnalyze(r.host,()=>{});
+                    deepResults[r.host]=res;
+                    if (res.deepIsTR){
+                        const row=document.getElementById(`row-${i}`);
+                        if (row){row.classList.remove('row-non-tr');row.classList.add('row-deep-tr');}
+                        const sc=document.getElementById(`status-${i}`);
+                        if (sc) sc.innerHTML+=`<br><span class="badge badge-yellow">🇹🇷 DERİN TR</span>`;
+                    }
+                    if (btn){btn.textContent='📋 Gör';btn.classList.remove('running');btn.classList.add('done');btn.disabled=false;}
+                } catch(e){if(btn){btn.textContent='❌';btn.disabled=false;}}
+            } else {
+                if(btn){btn.textContent='📋 Gör';btn.classList.add('done');btn.disabled=false;}
+            }
+            progBar.style.width=`${Math.round((i+1)/results.length*100)}%`;
+            await new Promise(r=>setTimeout(r,400));
+        }
+        sts.innerHTML=`✅ Tüm derin analizler tamamlandı.`;
+        document.getElementById('btn-deep-all').disabled=false;
+    };
+
+    // Event delegation
+    tbody.addEventListener('click',e=>{
+        const qo=e.target.closest('.quick-open');
+        if(qo){chrome.tabs.create({url:qo.getAttribute('data-url')});return;}
+        const db=e.target.closest('.deep-btn');
+        if(db) openDeepModal(db.getAttribute('data-host'),parseInt(db.getAttribute('data-idx')));
+    });
+
+    document.getElementById('modal-close-btn').onclick=()=>{ document.getElementById('deep-modal').style.display='none'; };
+    document.getElementById('deep-modal').addEventListener('click',e=>{
+        if(e.target===document.getElementById('deep-modal')) document.getElementById('deep-modal').style.display='none';
+    });
+
+    // CSV
+    const downloadCSV=(data,name)=>{
+        const header='\ufeffArama;Link;Registrar;IP;ISP;TRAltyapi;CDN;DerinTR;DerinKanit;TRSkoru;Durum\n';
+        const rows=data.map(r=>{
+            const dr=deepResults[r.host];
+            const deepTR=dr?(dr.deepIsTR?'EVET':'HAYIR'):'ANALİZ YOK';
+            const ev=dr?dr.evidence.join(' | '):'';
+            const skor=dr?`${dr.score.total}/${dr.score.max}`:'';
+            const cdn=dr?(dr.data.is_cdn?dr.data.cdn_name:'Hayır'):'';
+            return `${r.keyword||''};${r.u};${r.registrar};${r.ip};${r.isp};${r.isTR?'EVET':'HAYIR'};${cdn};${deepTR};${ev};${skor};${r.isReported?'DUZENLENDI':'DUZENLENMEDI'}`;
+        }).join('\n');
+        const blob=new Blob([header+rows],{type:'text/csv'});
+        const url=URL.createObjectURL(blob);
+        const a=document.createElement('a');
+        a.href=url;a.download=name;a.click();
+    };
+
+    document.getElementById('btn-dl-all').onclick   =()=>downloadCSV(results,'OSINT_Genel.csv');
+    document.getElementById('btn-dl-trdisi').onclick =()=>downloadCSV(results.filter(r=>!r.isTR),'OSINT_TRDisi.csv');
+    document.getElementById('btn-dl-deeptr').onclick =()=>{
+        const dt=results.filter(r=>deepResults[r.host]?.deepIsTR);
+        if(!dt.length){alert('Henüz derin analizde TR bulunan site yok.');return;}
+        downloadCSV(dt,'OSINT_DerinTR.csv');
+    };
+});

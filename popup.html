@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { box-sizing: border-box; }
+    body { width: 100%; min-width: 380px; font-family: 'Segoe UI', sans-serif; padding: 10px; background: #0f172a; color: #e2e8f0; margin: 0; }
+
+    .header { border-bottom: 2px solid #1e3a5f; padding-bottom: 8px; margin-bottom: 12px; }
+    .header h3 { margin: 0; font-size: 13px; color: #38bdf8; text-align: center; letter-spacing: 0.5px; }
+    .header p  { margin: 3px 0 0; font-size: 9px; color: #475569; text-align: center; }
+
+    .controls { background: #1e293b; padding: 10px; border-radius: 8px; border: 1px solid #334155; margin-bottom: 10px; }
+    .btn { width: 100%; padding: 9px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 11px; color: #fff; margin-bottom: 6px; display: block; transition: opacity 0.2s; }
+    .btn:hover   { opacity: 0.85; }
+    .btn:disabled{ opacity: 0.4; cursor: not-allowed; }
+    .btn-blue   { background: #2563eb; }
+    .btn-green  { background: #16a34a; }
+    .btn-gray   { background: #475569; }
+    .btn-dark   { background: #1e40af; }
+    .btn-orange { background: #c2410c; }
+    .btn-purple { background: #7c3aed; }
+    .btn-yellow { background: #b45309; }
+    .btn-teal   { background: #0f766e; }
+
+    .input-group { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 8px; font-size: 12px; color: #94a3b8; }
+    .input-group input[type="number"] { width: 55px; padding: 5px; border: 1px solid #334155; border-radius: 4px; text-align: center; background: #0f172a; color: #e2e8f0; }
+    .keyword-input { width: 100%; padding: 7px 10px; border: 1px solid #334155; border-radius: 6px; background: #0f172a; color: #e2e8f0; font-size: 11px; margin-bottom: 8px; resize: vertical; min-height: 50px; }
+    .keyword-input::placeholder { color: #475569; }
+    label { font-size: 11px; color: #94a3b8; display: block; margin-bottom: 3px; }
+
+    #sts { margin-bottom: 8px; font-weight: 600; color: #38bdf8; font-size: 11px; text-align: center; min-height: 16px; }
+    #liste-durum { margin-top: 6px; font-size: 11px; text-align: center; color: #64748b; }
+    .progress-wrap { background: #0f172a; border-radius: 4px; height: 5px; margin-bottom: 6px; overflow: hidden; }
+    .progress-bar  { height: 5px; background: linear-gradient(90deg,#2563eb,#38bdf8); width: 0%; transition: width 0.3s; border-radius: 4px; }
+    .tag-keyword   { display: inline-block; background: #1e3a5f; color: #38bdf8; border-radius: 3px; padding: 1px 5px; font-size: 9px; margin: 1px; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 10px; margin-top: 8px; table-layout: fixed; }
+    th, td { padding: 5px 6px; border: 1px solid #1e293b; text-align: left; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+    th { background: #1e293b; color: #94a3b8; position: sticky; top: 0; z-index: 2; }
+    td { background: #0f172a; color: #cbd5e1; }
+
+    @keyframes flash-red    { 0%,100%{background:#450a0a} 50%{background:#7f1d1d} }
+    @keyframes flash-yellow { 0%,100%{background:#422006} 50%{background:#854d0e} }
+    .row-non-tr  { animation: flash-red    1.2s ease-in-out infinite; }
+    .row-deep-tr { animation: flash-yellow 1.4s ease-in-out infinite; }
+    .row-non-tr td, .row-deep-tr td { background: transparent !important; }
+
+    .badge { display:inline-block; color:#fff; font-size:8px; font-weight:bold; padding:1px 4px; border-radius:3px; margin-right:2px; }
+    .badge-red    { background:#dc2626; }
+    .badge-yellow { background:#d97706; }
+    .badge-green  { background:#16a34a; }
+
+    .deep-btn {
+      display:block; background:#7c3aed; color:#fff; font-size:8px; font-weight:bold;
+      padding:3px 5px; border-radius:3px; cursor:pointer; margin-top:3px;
+      border:none; width:100%; text-align:center;
+    }
+    .deep-btn:hover   { background:#6d28d9; }
+    .deep-btn.done    { background:#15803d; }
+    .deep-btn.running { background:#1d4ed8; }
+
+    .divider-row td { background:#1e293b !important; color:#38bdf8; font-weight:bold; font-size:10px; text-align:center; padding:4px; border:1px solid #334155; }
+    .quick-open { color:#38bdf8; font-weight:bold; cursor:pointer; margin-right:3px; font-size:10px; }
+
+    #dl-area { display:none; flex-direction:column; gap:5px; margin-top:12px; }
+
+    /* ── MODAL ── */
+    #deep-modal {
+      display:none; position:fixed; top:0; left:0; width:100%; height:100%;
+      background:rgba(0,0,0,0.9); z-index:9999; overflow-y:auto; padding:10px;
+    }
+    .modal-box {
+      background:#0f172a; border:1px solid #334155; border-radius:10px;
+      padding:14px; max-width:640px; margin:0 auto; position:relative;
+    }
+    .modal-title { color:#38bdf8; font-size:12px; font-weight:bold; margin-bottom:8px; word-break:break-all; padding-right:60px; }
+    .modal-close { position:absolute; top:10px; right:10px; background:#475569; border:none; color:#fff; border-radius:4px; cursor:pointer; padding:3px 8px; font-size:11px; }
+
+    .step-log { background:#020617; border:1px solid #1e293b; border-radius:6px; padding:6px 10px; margin-bottom:10px; max-height:110px; overflow-y:auto; font-size:9px; font-family:monospace; }
+    .log-ok   { color:#4ade80; }
+    .log-hit  { color:#fbbf24; font-weight:bold; }
+    .log-err  { color:#f87171; }
+    .log-info { color:#38bdf8; }
+    .log-warn { color:#fb923c; }
+
+    .deep-section { margin-bottom:14px; }
+    .deep-section-title { font-size:10px; font-weight:bold; color:#64748b; border-bottom:1px solid #1e293b; padding-bottom:3px; margin-bottom:6px; text-transform:uppercase; letter-spacing:.5px; }
+    .deep-row { display:flex; gap:6px; padding:3px 0; border-bottom:1px solid #0a0f1a; font-size:10px; flex-wrap:wrap; }
+    .deep-key { color:#475569; min-width:130px; flex-shrink:0; }
+    .deep-val { color:#e2e8f0; word-break:break-all; flex:1; }
+    .deep-val.tr-hit  { color:#fbbf24; font-weight:bold; }
+    .deep-val.safe    { color:#4ade80; }
+    .deep-val.danger  { color:#f87171; }
+    .deep-val.neutral { color:#94a3b8; }
+
+    .verdict-tr   { background:#422006; border:1px solid #d97706; color:#fde68a; border-radius:6px; padding:8px 10px; text-align:center; font-weight:bold; font-size:11px; margin-bottom:10px; }
+    .verdict-safe { background:#052e16; border:1px solid #16a34a; color:#4ade80;  border-radius:6px; padding:8px 10px; text-align:center; font-weight:bold; font-size:11px; margin-bottom:10px; }
+
+    .evidence-box { background:#1a1000; border-left:3px solid #f59e0b; padding:8px 10px; border-radius:0 6px 6px 0; margin-top:10px; margin-bottom:10px; }
+    .evidence-title { color:#fbbf24; font-weight:bold; margin-bottom:5px; font-size:11px; }
+    .evidence-item  { color:#fde68a; padding:2px 0; font-size:10px; }
+    .evidence-item::before { content:"▶ "; color:#f59e0b; }
+
+    .spinner { display:inline-block; width:14px; height:14px; border:2px solid #1e293b; border-top-color:#38bdf8; border-radius:50%; animation:spin .7s linear infinite; margin-right:5px; vertical-align:middle; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    .deep-loading { text-align:center; color:#38bdf8; padding:20px; font-size:12px; }
+
+    .score-bar-wrap { background:#1e293b; border-radius:4px; height:8px; margin:6px 0; overflow:hidden; }
+    .score-bar { height:8px; border-radius:4px; transition:width .5s; }
+    .score-label { font-size:10px; font-weight:bold; margin-bottom:2px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h3>🔍 OSINT Teknik Analiz Sistemi v5</h3>
+    <p>Ultra Derin Altyapı Analizi — Cloudflare Bypass · Subdomain · SPF Zinciri · NSEC · BGP · crt.sh · Reverse IP</p>
+  </div>
+
+  <div class="controls">
+    <input type="file" id="file-upload" accept=".txt" style="display:none">
+    <button id="btn-yukle" class="btn btn-blue">📂 Listeyi Güncelle (.txt)</button>
+
+    <label for="keywords-input">🔎 Aranacak Kelimeler (virgülle ayır):</label>
+    <textarea id="keywords-input" class="keyword-input" placeholder="örnek: kumar sitesi, bahis, casino"></textarea>
+    <div id="keywords-preview" style="margin-bottom:8px;"></div>
+
+    <div class="input-group">
+      <span>Her kelime için sayfa:</span>
+      <input type="number" id="sayfa-sayisi" value="1" min="1" max="10">
+    </div>
+
+    <button id="btn-tara"    class="btn btn-green">🚀 Taramayı Başlat</button>
+    <button id="btn-temizle" class="btn btn-gray">🗑️ Hafızayı Sıfırla</button>
+    <div class="progress-wrap"><div class="progress-bar" id="progress-bar"></div></div>
+    <div id="liste-durum"></div>
+  </div>
+
+  <div id="sts">Hazır.</div>
+
+  <div style="overflow-x:auto;">
+    <table id="tbl">
+      <thead>
+        <tr>
+          <th style="width:42%;">URL</th>
+          <th style="width:28%;">Altyapı</th>
+          <th style="width:30%;">Durum</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+  <div id="dl-area">
+    <button id="btn-deep-all"   class="btn btn-purple">🔬 Tümüne Ultra Derin Analiz Yap</button>
+    <button id="btn-dl-all"     class="btn btn-dark">📊 Tümünü Raporla (CSV)</button>
+    <button id="btn-dl-trdisi"  class="btn btn-orange">⚠️ TR Dışı Altyapı (CSV)</button>
+    <button id="btn-dl-deeptr"  class="btn btn-yellow">🇹🇷 Derin Analizde TR Bulunanlar (CSV)</button>
+  </div>
+
+  <!-- MODAL -->
+  <div id="deep-modal">
+    <div class="modal-box">
+      <button class="modal-close" id="modal-close-btn">✕ Kapat</button>
+      <div class="modal-title" id="modal-domain-title">—</div>
+      <div class="step-log" id="modal-step-log"></div>
+      <div id="modal-content">
+        <div class="deep-loading"><span class="spinner"></span> Analiz yapılıyor...</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

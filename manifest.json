@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "DERİN Teknik Analiz Sistemi v5",
+  "version": "5.0",
+  "description": "Çoklu anahtar kelime, ultra derin altyapı analizi, Cloudflare bypass, subdomain, SPF zinciri, NSEC, WHOIS.",
+  "permissions": ["storage", "activeTab", "scripting", "sidePanel"],
+  "host_permissions": [
+    "https://dns.google/*",
+    "https://rdap.org/*",
+    "https://rdap.nic.tr/*",
+    "https://ipinfo.io/*",
+    "https://api.bgpview.io/*",
+    "https://crt.sh/*",
+    "https://api.hackertarget.com/*",
+    "https://www.google.com/*",
+    "https://whois.freeaiapi.xyz/*",
+    "https://networkcalc.com/*",
+    "https://api.mtr.sh/*",
+    "https://jwhois.net/*",
+    "https://www.whoisxmlapi.com/*"
+  ],
+  "side_panel": {
+    "default_path": "popup.html"
+  },
+  "action": {
+    "default_title": "OSINT Panelini Aç"
+  }
+}
