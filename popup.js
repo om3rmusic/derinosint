@@ -778,23 +778,92 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     };
 
-    const fetchGoogleLinks = async (searchUrl, maxPages) => {
-        let all = [], nextUrl = searchUrl;
-        for (let p = 1; p <= maxPages; p++) {
-            sts.innerHTML = `🌐 Sayfa ${p} okunuyor...`;
-            try {
-                const html = await tFetch(nextUrl);
-                const doc  = new DOMParser().parseFromString(html,'text/html');
-                const lnks = [...doc.querySelectorAll('div.g a, h3 a, .yuRUbf a')]
-                    .map(a=>a.href).filter(u=>u&&!u.includes('google.com')&&u.startsWith('http'));
-                all.push(...lnks);
-                const nxt = doc.querySelector('a#pnnext');
-                if (nxt && p<maxPages) nextUrl='https://www.google.com'+nxt.getAttribute('href');
-                else break;
-                await new Promise(r=>setTimeout(r,700));
-            } catch(e) { break; }
+    const extractGoogleResultLinks = (doc) => {
+        const links = new Set();
+
+        const selectors = [
+            'div.g a[href]', '.yuRUbf a[href]', 'h3 a[href]',
+            'a[data-ved][href*="/url?"]', 'a[jsname][href*="/url?"]'
+        ];
+
+        selectors.forEach(sel => {
+            [...doc.querySelectorAll(sel)].forEach(a => {
+                const href = a.getAttribute('href') || '';
+                let out = '';
+
+                if (href.startsWith('/url?')) {
+                    try {
+                        const u = new URL('https://www.google.com' + href);
+                        out = u.searchParams.get('q') || u.searchParams.get('url') || '';
+                    } catch(e) {}
+                } else if (href.startsWith('http')) {
+                    out = href;
+                }
+
+                if (!out) return;
+                try {
+                    const parsed = new URL(out);
+                    if (!/^https?:$/.test(parsed.protocol)) return;
+                    if (parsed.hostname.includes('google.')) return;
+                    links.add(parsed.toString());
+                } catch(e) {}
+            });
+        });
+
+        return [...links];
+    };
+
+    const isGoogleChallengePage = html => /sorry\/index|detected unusual traffic|recaptcha|our systems have detected/i.test(html || '');
+
+    const isSearchPage = doc => !!doc.querySelector('form[action="/search"], #search, #rso, .g, .MjjYud');
+
+    const googleUrlPatterns = (keyword, page = 0) => {
+        const start = page * 10;
+        const q = encodeURIComponent(keyword);
+        return [
+            `https://www.google.com/search?q=${q}&hl=tr&gl=tr&num=10&start=${start}&pws=0`,
+            `https://www.google.com/search?q=${q}&hl=tr&gl=tr&num=10&start=${start}&gbv=1&pws=0`,
+            `https://www.google.com/search?q=${q}&hl=tr&gl=tr&num=10&start=${start}&udm=14&pws=0`
+        ];
+    };
+
+    const fetchGoogleLinks = async (keyword, maxPages) => {
+        let all = [];
+
+        for (let p = 0; p < maxPages; p++) {
+            sts.innerHTML = `🌐 Sayfa ${p+1} okunuyor...`;
+            let pageLinks = [];
+
+            for (const patternUrl of googleUrlPatterns(keyword, p)) {
+                try {
+                    const html = await tFetch(patternUrl, 12000);
+                    if (!html || html.length < 300) continue;
+
+                    if (isGoogleChallengePage(html)) continue;
+
+                    const doc = new DOMParser().parseFromString(html, 'text/html');
+                    if (!isSearchPage(doc)) continue;
+
+                    const extracted = extractGoogleResultLinks(doc);
+                    if (extracted.length) {
+                        pageLinks = extracted;
+                        break;
+                    }
+                } catch(e) {}
+
+                await new Promise(r=>setTimeout(r, 450));
+            }
+
+            if (!pageLinks.length) {
+                if (p === 0) sts.innerHTML = '⚠️ Google sonuçları bot korumasına takıldı veya boş döndü.';
+                break;
+            }
+
+            all.push(...pageLinks);
+            await new Promise(r=>setTimeout(r, 700 + Math.floor(Math.random()*350)));
         }
-        return all;
+
+        return [...new Set(all)];
     };
 
     const insertDivider = (kw, count) => {
@@ -843,10 +912,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         for (let i=0;i<keywords.length;i++) {
             const kw=keywords[i];
             sts.innerHTML=`🌐 "${kw}" aranıyor...`;
-            const links=[...new Set(await fetchGoogleLinks(`https://www.google.com/search?q=${encodeURIComponent(kw)}&hl=tr`,maxPages))];
+            const links = await fetchGoogleLinks(kw, maxPages);
             kwLinks.push({keyword:kw,links});
             totalLinks+=links.length;
             progBar.style.width=`${Math.round((i+1)/keywords.length*20)}%`;
+        }
+
+        if (!totalLinks) {
+            progBar.style.width='100%';
+            sts.innerHTML='⚠️ Sonuç bulunamadı veya Google bot koruması nedeniyle veri alınamadı.';
+            return;
         }
 
         sts.innerHTML=`🔎 Toplam ${totalLinks} URL analiz edilecek...`;
